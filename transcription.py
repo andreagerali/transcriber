@@ -186,6 +186,7 @@ def transcribe_with_timestamps(
     model_size: str = "base",
     language: str | None = None,
     domain_category: str | None = None,
+    initial_prompt: str | None = None,
     max_duration: int | None = None,
     device: str = "cpu",
     compute_type: str | None = None,
@@ -201,6 +202,9 @@ def transcribe_with_timestamps(
         model_size: Whisper model size, HF repo id, or local CT2 dir.
         language: Force language code (e.g., 'en', 'zh'). None = auto-detect.
         domain_category: Domain for Cantonese vocabulary hints (e.g., 'iching').
+        initial_prompt: Free-form text passed to Whisper as initial_prompt to bias
+            vocabulary recognition. Works in any language. If both this and
+            domain_category are provided, this explicit prompt wins.
         max_duration: Only transcribe first N seconds (for testing).
         device: 'cpu' or 'cuda'.
         compute_type: CTranslate2 compute type override. None = auto by device.
@@ -216,10 +220,14 @@ def transcribe_with_timestamps(
     """
     model = load_model(model_size, compute_type=compute_type, device=device)
 
-    # Get domain-specific vocabulary prompt for Cantonese
-    initial_prompt = get_domain_prompt(domain_category) if domain_category else None
-    if initial_prompt:
-        logger.info(f"Using domain prompt for '{domain_category}'")
+    # Resolve initial prompt: explicit caller-supplied value wins; otherwise
+    # fall back to the Cantonese domain dictionary.
+    if initial_prompt is None and domain_category:
+        initial_prompt = get_domain_prompt(domain_category)
+        if initial_prompt:
+            logger.info(f"Using domain prompt for '{domain_category}'")
+    elif initial_prompt:
+        logger.info("Using caller-supplied initial_prompt (overrides --domain).")
 
     print(f"Transcribing (language: {language or 'auto-detect'})...")
 

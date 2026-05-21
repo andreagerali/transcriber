@@ -75,6 +75,18 @@ def parse_args() -> argparse.Namespace:
         help="Cantonese domain vocabulary hints (e.g., iching, geopolitics, finance).",
     )
     parser.add_argument(
+        "--initial-prompt",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Free-form text passed to Whisper as initial_prompt to bias terminology "
+            "recognition. Works in any language. Example for an English economics "
+            "interview: --initial-prompt \"Discussion of US-China tariffs, "
+            "transshipment, rules of origin, FDI screening, semiconductors.\" "
+            "If both --initial-prompt and --domain are given, --initial-prompt wins."
+        ),
+    )
+    parser.add_argument(
         "--format",
         default="both",
         choices=["srt", "txt", "both"],
@@ -274,6 +286,7 @@ def main() -> int:
             model_size=args.model,
             language=args.language,
             domain_category=args.domain,
+            initial_prompt=args.initial_prompt,
             max_duration=args.max_duration,
             device=effective_device,
             compute_type=args.compute_type,
