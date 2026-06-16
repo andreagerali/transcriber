@@ -37,17 +37,137 @@ logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 
-# Mutually-exclusive language presets. The first entry is the conventional
-# default/fallback language for the pair.
-MODE_LANGUAGE_SETS: dict[str, tuple[str, ...]] = {
+# --mode shortcuts. Prefer --langs; these are kept for convenience and
+# backward compatibility. Each expands to a --langs value.
+MODE_ALIASES: dict[str, tuple[str, ...]] = {
     "jp": ("en", "ja"),
     "kr": ("en", "ko"),
 }
 
+# Groups of acoustically near-identical languages that Whisper's audio language
+# identification cannot reliably tell apart. Two uses:
+#   1. Feasibility guard: refuse a multilingual run whose requested languages
+#      fall in the same group (e.g. id+ms), since per-chunk detection would
+#      mislabel turns. Overridable with --force-langs.
+#   2. Canonicalization: if a chunk is detected as a sibling of an active
+#      language (e.g. detected 'ms' while the run uses 'id'), map it to the
+#      active member instead of discarding it as out-of-set.
+# Curated and non-exhaustive — extend as needed. faster-whisper folds Cantonese
+# under the 'zh' token, so {zh, yue} is handled here too.
+SIBLING_GROUPS: list[frozenset[str]] = [
+    frozenset({"id", "ms"}),        # Indonesian / Malay — mutually intelligible
+    frozenset({"hi", "ur"}),        # Hindi / Urdu — same spoken Hindustani
+    frozenset({"zh", "yue"}),       # Mandarin / Cantonese (shared 'zh' token)
+    frozenset({"hr", "sr", "bs"}),  # Serbo-Croatian continuum
+    frozenset({"cs", "sk"}),        # Czech / Slovak
+]
+
 # Above this confidence, trust the detected language even on a chunk shorter
-# than --min-chunk-duration. EN vs JA/KO is acoustically very distinct, so a
+# than --min-chunk-duration. EN vs JA/KO/ZH is acoustically very distinct, so a
 # high-probability detection on a short clip is still reliable.
 _HIGH_CONFIDENCE = 0.80
+
+
+def _parse_langs(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated --langs value into a clean, deduped tuple."""
+    seen: list[str] = []
+    for part in raw.split(","):
+        code = part.strip().lower()
+        if code and code not in seen:
+            seen.append(code)
+    return tuple(seen)
+
+
+def _confusable_conflict(active_set: tuple[str, ...]) -> frozenset[str] | None:
+    """Return the sibling group if two active languages are confusable, else None."""
+    for group in SIBLING_GROUPS:
+        if len(group & set(active_set)) >= 2:
+            return group
+    return None
+
+
+def resolve_active_languages(args) -> tuple[tuple[str, ...], str]:
+    """
+    Resolve the active language set and default/fallback language from args.
+
+    Priority: --langs overrides --mode. Raises ValueError (with a user-facing
+    message) on an empty/单-language set or a confusable pair (unless
+    --force-langs).
+    """
+    if getattr(args, "langs", None):
+        active_set = _parse_langs(args.langs)
+    elif getattr(args, "mode", None):
+        active_set = MODE_ALIASES[args.mode]
+    else:  # pragma: no cover - dispatch guards this
+        raise ValueError("multilingual mode requires --langs or --mode")
+
+    if len(active_set) < 2:
+        raise ValueError(
+            f"multilingual mode needs at least two languages (got {active_set!r}). "
+            "For a single language use -l/--language instead."
+        )
+
+    conflict = _confusable_conflict(active_set)
+    if conflict and not getattr(args, "force_langs", False):
+        members = ", ".join(sorted(conflict))
+        raise ValueError(
+            f"languages {sorted(set(active_set) & conflict)} are acoustically "
+            f"near-identical (group: {members}); per-chunk language detection "
+            "cannot reliably tell them apart and would mislabel turns. Pick one "
+            "of them, or pass --force-langs to override."
+        )
+
+    default_lang = (getattr(args, "default_language", None) or active_set[0]).lower()
+    if default_lang not in active_set:
+        print(
+            f"WARNING: --default-language '{default_lang}' is not in {active_set}; "
+            f"using '{active_set[0]}'.",
+            file=sys.stderr,
+        )
+        default_lang = active_set[0]
+
+    return active_set, default_lang
+
+
+def _canonicalize(detected: str, active_set: tuple[str, ...]) -> str:
+    """Map a detected sibling language to the active member of its group."""
+    if detected in active_set:
+        return detected
+    for group in SIBLING_GROUPS:
+        if detected in group:
+            for lang in active_set:
+                if lang in group:
+                    return lang
+    return detected
+
+
+def _build_prompts(args) -> dict[str, str]:
+    """
+    Assemble the per-language initial_prompt map.
+
+    Generic repeatable --prompt CODE=TEXT is the canonical source (zero-code
+    extensibility). The legacy --initial-prompt-en/-ja/-ko flags are still
+    honoured for backward compatibility; --prompt wins on conflict.
+    """
+    prompts: dict[str, str] = {}
+    for attr, code in (
+        ("initial_prompt_en", "en"),
+        ("initial_prompt_ja", "ja"),
+        ("initial_prompt_ko", "ko"),
+    ):
+        val = getattr(args, attr, None)
+        if val:
+            prompts[code] = val
+    for item in getattr(args, "prompt", None) or []:
+        if "=" not in item:
+            print(
+                f"WARNING: ignoring --prompt '{item}' (expected CODE=TEXT).",
+                file=sys.stderr,
+            )
+            continue
+        code, text = item.split("=", 1)
+        prompts[code.strip().lower()] = text
+    return prompts
 
 
 def _marker_time(seconds: float) -> str:
@@ -114,41 +234,32 @@ def run_multilingual(audio_path: str, input_name: str, args, device: str) -> int
     Returns:
         Process exit code (0 on success).
     """
-    active_set = MODE_LANGUAGE_SETS[args.mode]
-    default_lang = (args.default_language or "en").lower()
-    if default_lang not in active_set:
-        fallback = "en" if "en" in active_set else active_set[0]
-        print(
-            f"WARNING: --default-language '{default_lang}' is not in the "
-            f"--mode {args.mode} set {active_set}; using '{fallback}'.",
-            file=sys.stderr,
-        )
-        default_lang = fallback
+    active_set, default_lang = resolve_active_languages(args)
 
-    # Per-language initial prompts. Only languages in the active set are used;
-    # warn on prompts supplied for the inactive language.
-    prompts = {
-        "en": getattr(args, "initial_prompt_en", None),
-        "ja": getattr(args, "initial_prompt_ja", None),
-        "ko": getattr(args, "initial_prompt_ko", None),
-    }
-    for lang, prompt in prompts.items():
-        if prompt and lang not in active_set:
+    prompts = _build_prompts(args)
+    for lang in prompts:
+        if lang not in active_set:
             print(
-                f"WARNING: --initial-prompt-{lang} supplied but '{lang}' is not "
-                f"active in --mode {args.mode}; it will be ignored.",
+                f"WARNING: prompt supplied for '{lang}' but it is not in the "
+                f"active set {active_set}; it will be ignored.",
                 file=sys.stderr,
             )
     if getattr(args, "initial_prompt", None):
         print(
             "WARNING: --initial-prompt is ignored in multilingual mode; use "
-            "--initial-prompt-en / --initial-prompt-ja / --initial-prompt-ko.",
+            "--prompt CODE=TEXT (e.g. --prompt en=\"...\" --prompt ja=\"...\").",
             file=sys.stderr,
         )
     if getattr(args, "language", None):
         print(
             "WARNING: -l/--language is ignored in multilingual mode; languages "
-            f"are fixed by --mode {args.mode} {active_set}.",
+            f"are fixed by the active set {active_set}.",
+            file=sys.stderr,
+        )
+    if len(active_set) > 2:
+        print(
+            f"NOTE: {len(active_set)} languages requested {active_set}. Detection "
+            "accuracy is best with two (EN + one); more candidates dilute it.",
             file=sys.stderr,
         )
 
@@ -180,7 +291,7 @@ def run_multilingual(audio_path: str, input_name: str, args, device: str) -> int
     print(
         f"Found {len(chunks)} speech chunks across {total_dur/60:.1f} min. "
         f"Detecting language and transcribing per chunk "
-        f"(mode={args.mode} {active_set}, default={default_lang})..."
+        f"(langs={active_set}, default={default_lang})..."
     )
 
     condition_prev = not getattr(args, "no_condition_prev", False)
@@ -217,8 +328,10 @@ def run_multilingual(audio_path: str, input_name: str, args, device: str) -> int
             logger.warning("detect_language failed on chunk %d: %s", idx, exc)
             detected, prob = default_lang, 0.0
 
+        # Map a detected sibling (e.g. 'ms') to the active member ('id').
+        canon = _canonicalize(detected, active_set)
         used, reason = _decide_language(
-            detected,
+            canon,
             prob,
             duration,
             active_set,
@@ -303,7 +416,7 @@ def run_multilingual(audio_path: str, input_name: str, args, device: str) -> int
     # --- Summary ---
     print()
     print("=" * 60)
-    print(f"  Mode:       {args.mode} {active_set}")
+    print(f"  Languages:  {active_set}")
     print(f"  Duration:   {total_dur:.1f}s ({total_dur/60:.1f} min)")
     print(f"  Chunks:     {len(chunks)}")
     print(f"  Segments:   {len(all_segments)}")

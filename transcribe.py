@@ -35,13 +35,16 @@ def parse_args() -> argparse.Namespace:
             "  python transcribe.py lecture.mp4 -m small --format srt\n"
             "  python transcribe.py video.mp4 --compress\n"
             "  python transcribe.py video.mp4 --compress --compress-quality balanced\n"
-            '  python transcribe.py interview.m4a -m turbo --mode jp --audit-csv\n'
-            '  python transcribe.py seoul.m4a -m turbo --mode kr --initial-prompt-en "..."\n'
+            '  python transcribe.py interview.m4a -m turbo --langs en,ja --audit-csv\n'
+            '  python transcribe.py seoul.m4a -m turbo --langs en,ko --prompt en="..."\n'
+            '  python transcribe.py beijing.m4a -m turbo --langs en,zh\n'
             "\n"
-            "Multilingual mode (two declared languages, e.g. EN+JA or EN+KO):\n"
-            "  --mode jp  -> {en, ja}   --mode kr  -> {en, ko}\n"
+            "Multilingual mode (two declared languages):\n"
+            "  --langs en,ja  (or --langs en,zh / en,vi / en,th / en,id ...)\n"
+            "  --mode jp == --langs en,ja ; --mode kr == --langs en,ko (shortcuts)\n"
             "  Splits on VAD, detects language per chunk, transcribes each in its language.\n"
-            "  Add --audit-csv to log the per-chunk language decision.\n"
+            "  Add --prompt CODE=TEXT per language, and --audit-csv to log decisions.\n"
+            "  Near-identical pairs (id+ms, hi+ur) are refused unless --force-langs.\n"
             "\n"
             "Language tips:\n"
             "  For Cantonese content, use: -l zh  (NOT -l yue)\n"
@@ -104,21 +107,36 @@ def parse_args() -> argparse.Namespace:
         "and transcribes each chunk in its own language.",
     )
     multi.add_argument(
-        "--mode",
-        choices=["jp", "kr"],
+        "--langs",
         default=None,
+        metavar="CODES",
         help=(
-            "Enable multilingual chunk pipeline with a fixed language pair: "
-            "'jp' = English+Japanese {en,ja}, 'kr' = English+Korean {en,ko}. "
-            "The pairs are mutually exclusive (JA and KO are never mixed). "
-            "When set, -l/--language is ignored."
+            "Enable the multilingual chunk pipeline for the comma-separated "
+            "language codes actually present in the recording, e.g. 'en,ja', "
+            "'en,zh', 'en,vi'. Keep it to two (English + one). When set, "
+            "-l/--language is ignored. Acoustically near-identical pairs (e.g. "
+            "id+ms, hi+ur) are refused unless --force-langs."
         ),
     )
     multi.add_argument(
+        "--mode",
+        choices=["jp", "kr"],
+        default=None,
+        help="Shortcut presets: 'jp' = --langs en,ja ; 'kr' = --langs en,ko. Prefer --langs.",
+    )
+    multi.add_argument(
+        "--force-langs",
+        action="store_true",
+        help="Override the refusal of an acoustically confusable language pair (e.g. id+ms).",
+    )
+    multi.add_argument(
         "--default-language",
-        default="en",
+        default=None,
         metavar="CODE",
-        help="Fallback language for chunks with out-of-set or low-confidence detection (default: en).",
+        help=(
+            "Fallback language for chunks with out-of-set or low-confidence "
+            "detection (default: the first language in --langs)."
+        ),
     )
     multi.add_argument(
         "--min-chunk-duration",
@@ -139,23 +157,20 @@ def parse_args() -> argparse.Namespace:
         help="Minimum detection probability to accept a detected language (default: 0.45).",
     )
     multi.add_argument(
-        "--initial-prompt-en",
+        "--prompt",
+        action="append",
         default=None,
-        metavar="TEXT",
-        help="initial_prompt applied to chunks transcribed as English (multilingual mode).",
+        metavar="CODE=TEXT",
+        help=(
+            "Per-language initial_prompt, repeatable: "
+            "--prompt en=\"...\" --prompt ja=\"...\". Biases terminology for "
+            "chunks transcribed as CODE. Add one per active language."
+        ),
     )
-    multi.add_argument(
-        "--initial-prompt-ja",
-        default=None,
-        metavar="TEXT",
-        help="initial_prompt applied to chunks transcribed as Japanese (--mode jp).",
-    )
-    multi.add_argument(
-        "--initial-prompt-ko",
-        default=None,
-        metavar="TEXT",
-        help="initial_prompt applied to chunks transcribed as Korean (--mode kr).",
-    )
+    # Back-compat aliases for --prompt (prefer --prompt CODE=TEXT).
+    multi.add_argument("--initial-prompt-en", default=None, metavar="TEXT", help=argparse.SUPPRESS)
+    multi.add_argument("--initial-prompt-ja", default=None, metavar="TEXT", help=argparse.SUPPRESS)
+    multi.add_argument("--initial-prompt-ko", default=None, metavar="TEXT", help=argparse.SUPPRESS)
     multi.add_argument(
         "--vad-threshold",
         type=float,
@@ -387,9 +402,13 @@ def main() -> int:
                     audio_path = args.input
 
         # --- Multilingual chunk-based path (two declared languages) ---
-        if args.mode:
+        if args.langs or args.mode:
             from multilingual import run_multilingual
-            return run_multilingual(audio_path, input_name, args, effective_device)
+            try:
+                return run_multilingual(audio_path, input_name, args, effective_device)
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 2
 
         # --- Step 2: Transcribe ---
         start_time = time.time()
