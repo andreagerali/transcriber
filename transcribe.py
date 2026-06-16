@@ -35,6 +35,13 @@ def parse_args() -> argparse.Namespace:
             "  python transcribe.py lecture.mp4 -m small --format srt\n"
             "  python transcribe.py video.mp4 --compress\n"
             "  python transcribe.py video.mp4 --compress --compress-quality balanced\n"
+            '  python transcribe.py interview.m4a -m turbo --mode jp --audit-csv\n'
+            '  python transcribe.py seoul.m4a -m turbo --mode kr --initial-prompt-en "..."\n'
+            "\n"
+            "Multilingual mode (two declared languages, e.g. EN+JA or EN+KO):\n"
+            "  --mode jp  -> {en, ja}   --mode kr  -> {en, ko}\n"
+            "  Splits on VAD, detects language per chunk, transcribes each in its language.\n"
+            "  Add --audit-csv to log the per-chunk language decision.\n"
             "\n"
             "Language tips:\n"
             "  For Cantonese content, use: -l zh  (NOT -l yue)\n"
@@ -83,8 +90,101 @@ def parse_args() -> argparse.Namespace:
             "recognition. Works in any language. Example for an English economics "
             "interview: --initial-prompt \"Discussion of US-China tariffs, "
             "transshipment, rules of origin, FDI screening, semiconductors.\" "
-            "If both --initial-prompt and --domain are given, --initial-prompt wins."
+            "If both --initial-prompt and --domain are given, --initial-prompt wins. "
+            "Ignored in --mode multilingual (use --initial-prompt-en/-ja/-ko)."
         ),
+    )
+
+    # --- Multilingual (chunk-based, two-language) options ---
+    multi = parser.add_argument_group(
+        "multilingual mode",
+        "Transcribe recordings that alternate between two declared languages "
+        "(e.g. an English interview with a Japanese expert answering in Japanese). "
+        "Splits the audio on VAD boundaries, detects the language of each chunk, "
+        "and transcribes each chunk in its own language.",
+    )
+    multi.add_argument(
+        "--mode",
+        choices=["jp", "kr"],
+        default=None,
+        help=(
+            "Enable multilingual chunk pipeline with a fixed language pair: "
+            "'jp' = English+Japanese {en,ja}, 'kr' = English+Korean {en,ko}. "
+            "The pairs are mutually exclusive (JA and KO are never mixed). "
+            "When set, -l/--language is ignored."
+        ),
+    )
+    multi.add_argument(
+        "--default-language",
+        default="en",
+        metavar="CODE",
+        help="Fallback language for chunks with out-of-set or low-confidence detection (default: en).",
+    )
+    multi.add_argument(
+        "--min-chunk-duration",
+        type=float,
+        default=10.0,
+        metavar="SECS",
+        help=(
+            "Chunks shorter than this require high detection confidence (>0.80) to "
+            "trust the detected language; otherwise they fall back to the default "
+            "language (default: 10)."
+        ),
+    )
+    multi.add_argument(
+        "--lang-detect-threshold",
+        type=float,
+        default=0.45,
+        metavar="P",
+        help="Minimum detection probability to accept a detected language (default: 0.45).",
+    )
+    multi.add_argument(
+        "--initial-prompt-en",
+        default=None,
+        metavar="TEXT",
+        help="initial_prompt applied to chunks transcribed as English (multilingual mode).",
+    )
+    multi.add_argument(
+        "--initial-prompt-ja",
+        default=None,
+        metavar="TEXT",
+        help="initial_prompt applied to chunks transcribed as Japanese (--mode jp).",
+    )
+    multi.add_argument(
+        "--initial-prompt-ko",
+        default=None,
+        metavar="TEXT",
+        help="initial_prompt applied to chunks transcribed as Korean (--mode kr).",
+    )
+    multi.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.5,
+        metavar="P",
+        help="Silero VAD speech probability threshold (default: 0.5).",
+    )
+    multi.add_argument(
+        "--vad-min-silence-ms",
+        type=int,
+        default=700,
+        metavar="MS",
+        help=(
+            "Minimum silence (ms) that splits two speech chunks. Lower = finer "
+            "turn boundaries (better language separation), higher = fewer, longer "
+            "chunks (default: 700; faster-whisper's own default is 2000)."
+        ),
+    )
+    multi.add_argument(
+        "--vad-speech-pad-ms",
+        type=int,
+        default=200,
+        metavar="MS",
+        help="Padding (ms) added around each VAD speech chunk (default: 200).",
+    )
+    multi.add_argument(
+        "--audit-csv",
+        action="store_true",
+        help="Also write a <name>.lang.csv logging the language decision for every chunk.",
     )
     parser.add_argument(
         "--format",
@@ -160,6 +260,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # Make console output UTF-8 safe so non-ASCII paths/filenames (e.g. a
+    # Japanese-named recording) never crash the run on a cp1252 Windows console.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
     args = parse_args()
 
     # Configure logging
@@ -277,6 +385,11 @@ def main() -> int:
                 except RuntimeError:
                     # Maybe it's already audio — try directly
                     audio_path = args.input
+
+        # --- Multilingual chunk-based path (two declared languages) ---
+        if args.mode:
+            from multilingual import run_multilingual
+            return run_multilingual(audio_path, input_name, args, effective_device)
 
         # --- Step 2: Transcribe ---
         start_time = time.time()
