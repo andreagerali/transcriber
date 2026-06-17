@@ -94,7 +94,8 @@ def parse_args() -> argparse.Namespace:
             "interview: --initial-prompt \"Discussion of US-China tariffs, "
             "transshipment, rules of origin, FDI screening, semiconductors.\" "
             "If both --initial-prompt and --domain are given, --initial-prompt wins. "
-            "Ignored in --mode multilingual (use --initial-prompt-en/-ja/-ko)."
+            "Ignored in multilingual mode; there, use --prompt CODE=TEXT per language "
+            "(e.g. --prompt en=\"...\" --prompt ja=\"...\")."
         ),
     )
 
@@ -402,7 +403,10 @@ def main() -> int:
                     audio_path = args.input
 
         # --- Multilingual chunk-based path (two declared languages) ---
-        if args.langs or args.mode:
+        # Test presence, not truthiness: --langs "" should enter the path and
+        # fail with a clear "needs two languages" error, not silently fall
+        # through to single-language transcription.
+        if args.langs is not None or args.mode is not None:
             from multilingual import run_multilingual
             try:
                 return run_multilingual(audio_path, input_name, args, effective_device)

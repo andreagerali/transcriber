@@ -270,14 +270,18 @@ def transcribe_with_timestamps(
         ]
         if any(indicator in transcript for indicator in garbled_indicators):
             print("Transcription looks garbled, retrying with English...")
-            retry_segments, retry_info = model.transcribe(
-                audio=audio_path,
-                language="en",
-                initial_prompt=initial_prompt,
-                vad_filter=vad_filter,
-                word_timestamps=word_timestamps,
-                condition_on_previous_text=condition_on_previous_text,
-            )
+            retry_kwargs = {
+                "audio": audio_path,
+                "language": "en",
+                "initial_prompt": initial_prompt,
+                "vad_filter": vad_filter,
+                "word_timestamps": word_timestamps,
+                "condition_on_previous_text": condition_on_previous_text,
+            }
+            # Honour --max-duration on retry too (mirror the original call).
+            if max_duration:
+                retry_kwargs["clip_timestamps"] = f"0,{max_duration}"
+            retry_segments, retry_info = model.transcribe(**retry_kwargs)
             segment_list = []
             for seg in retry_segments:
                 if seg is None:

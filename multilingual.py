@@ -94,9 +94,9 @@ def resolve_active_languages(args) -> tuple[tuple[str, ...], str]:
     message) on an empty/单-language set or a confusable pair (unless
     --force-langs).
     """
-    if getattr(args, "langs", None):
+    if getattr(args, "langs", None) is not None:
         active_set = _parse_langs(args.langs)
-    elif getattr(args, "mode", None):
+    elif getattr(args, "mode", None) is not None:
         active_set = MODE_ALIASES[args.mode]
     else:  # pragma: no cover - dispatch guards this
         raise ValueError("multilingual mode requires --langs or --mode")
